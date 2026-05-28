@@ -117,11 +117,14 @@ use core::mem::ManuallyDrop;
 use enumset::{EnumSet, EnumSetType, enum_set};
 use private::*;
 
+// Used by the non-ESP32 reset paths (tx_conf/rx_conf toggle); unused on ESP32
+// where reset_tx/reset_rx now use an explicit read-back barrier instead.
+#[allow(unused_imports)]
+use crate::RegisterToggle;
 use crate::{
     Async,
     Blocking,
     DriverMode,
-    RegisterToggle,
     dma::{
         Channel,
         ChannelRx,
@@ -1780,15 +1783,23 @@ mod private {
         }
 
         fn reset_tx(&self) {
-            self.regs().conf().toggle(|w, bit| {
-                w.tx_reset().bit(bit);
-                w.tx_fifo_reset().bit(bit)
-            });
+            // Assert resets, read back as a bus barrier, then deassert.
+            // A bare toggle() (back-to-back set+clear) is too fast for the
+            // ESP32 I2S hardware — the peripheral does not register the
+            // reset pulse, causing tx_start() to hang on the next transfer.
+            self.regs()
+                .conf()
+                .modify(|_, w| w.tx_reset().set_bit().tx_fifo_reset().set_bit());
+            self.regs().lc_conf().modify(|_, w| w.out_rst().set_bit());
+            let _ = self.regs().conf().read();
 
             #[cfg(esp32s2)]
             while self.regs().conf().read().tx_reset_st().bit_is_set() {}
 
-            self.regs().lc_conf().toggle(|w, bit| w.out_rst().bit(bit));
+            self.regs()
+                .conf()
+                .modify(|_, w| w.tx_reset().clear_bit().tx_fifo_reset().clear_bit());
+            self.regs().lc_conf().modify(|_, w| w.out_rst().clear_bit());
 
             self.regs().int_clr().write(|w| {
                 w.out_done().clear_bit_by_one();
@@ -1817,15 +1828,21 @@ mod private {
         }
 
         fn reset_rx(&self) {
-            self.regs().conf().toggle(|w, bit| {
-                w.rx_reset().bit(bit);
-                w.rx_fifo_reset().bit(bit)
-            });
+            // Assert resets, read back as a bus barrier, then deassert.
+            // A bare toggle() is too fast for the ESP32 I2S hardware.
+            self.regs()
+                .conf()
+                .modify(|_, w| w.rx_reset().set_bit().rx_fifo_reset().set_bit());
+            self.regs().lc_conf().modify(|_, w| w.in_rst().set_bit());
+            let _ = self.regs().conf().read();
 
             #[cfg(esp32s2)]
             while self.regs().conf().read().rx_reset_st().bit_is_set() {}
 
-            self.regs().lc_conf().toggle(|w, bit| w.in_rst().bit(bit));
+            self.regs()
+                .conf()
+                .modify(|_, w| w.rx_reset().clear_bit().rx_fifo_reset().clear_bit());
+            self.regs().lc_conf().modify(|_, w| w.in_rst().clear_bit());
 
             self.regs().int_clr().write(|w| {
                 w.in_done().clear_bit_by_one();
